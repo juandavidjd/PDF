@@ -1,0 +1,7 @@
+python scraper_astroluna.py
+python scraper_baloto_premios.py
+python scraper_baloto_resultados.py
+python scraper_loterias.py
+python scraper_revancha_premios.py
+python scraper_revancha_resultados.py
+
