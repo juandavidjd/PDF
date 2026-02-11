@@ -1,0 +1,13 @@
+Para impedir que los scrapers legacy vuelquen HB/NOOP o filas negativas/fechas inválidas, añade al inicio:
+
+
+from scraper_utils import guard_rows_dict
+
+
+Y justo antes de escribir al CSV, envuelve la lista de dicts:
+
+
+rows = guard_rows_dict(rows)
+
+
+Si quieres conservar el modo diagnóstico que sí escriba HB/NOOP, exporta RP_WRITE_HB_TO_CSV=1.
