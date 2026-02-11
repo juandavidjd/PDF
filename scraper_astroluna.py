@@ -1,80 +1,84 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-AstroLuna -> data\crudo\astro_luna.csv
-Header: fecha,signo,numero,luna
+# scraper_astroluna.py
 
-Este scraper es prudente: si no encuentra nueva info, NO toca el CSV.
-Debido a variaciones de fuente, deja un “hook” para que configures la URL
-y los selectores sin riesgo de corromper datos.
-"""
-import argparse, re
-from pathlib import Path
-from scraper_utils import mk_session, fetch, soupify, read_csv_dict, write_csv_dict, merge_unique, log
+import os
+import time
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+from scraper_utils import cargar_fechas_existentes, guardar_nuevos, log
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
-# CONFIGURA A TU FUENTE REAL:
-SOURCE_URL = "https://tu-fuente-astroluna.example/"   # <--- AJUSTA
-# Selectores candidatos (ajusta a tu HTML real)
-SEL_ROW = [".tabla-astro tr", ".listado tr", "table tr"]
-SEL_FECHA = ["td.fecha", ".fecha", "time"]
-SEL_SIGNO = ["td.signo", ".signo"]
-SEL_NUMERO = ["td.numero", ".numero"]
-SEL_LUNA = ["td.luna", ".luna"]
+# Ruta de salida
+OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../data/crudo"))
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+DESTINO = os.path.join(OUTPUT_DIR, "astro_luna.csv")
+URL = "https://superastro.com.co/historico.php"
 
-def pick_text(row, selectors):
-    for s in selectors:
-        el = row.select_one(s)
-        if el:
-            t = el.get_text(" ", strip=True)
-            if t: return t
-    return None
+log("=== Inicio de scrapeo de AstroLuna ===")
 
-def parse_rows(html):
-    soup = soupify(html)
-    rows=[]
-    for sel in SEL_ROW:
-        for tr in soup.select(sel):
-            fecha = pick_text(tr, SEL_FECHA)
-            signo = pick_text(tr, SEL_SIGNO)
-            numero = pick_text(tr, SEL_NUMERO)
-            luna = pick_text(tr, SEL_LUNA)
-            if numero and signo and fecha:
-                rows.append({"fecha": fecha, "signo": signo, "numero": numero, "luna": luna or ""})
-    return rows
+# Configura Selenium en modo sin cabeza
+options = Options()
+options.add_argument("--headless=new")
+options.add_argument("--disable-gpu")
+options.add_argument("--no-sandbox")
+options.add_argument("--window-size=1920x1080")
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--url", default=SOURCE_URL)
-    args = ap.parse_args()
+try:
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver.get(URL)
+    time.sleep(3)
+    html = driver.page_source
+    driver.quit()
+except Exception as e:
+    log(f"[ERROR] Fallo al iniciar navegador: {e}")
+    exit(1)
 
-    out = Path(args.out)
-    headers, existing = read_csv_dict(out)
-    if not headers:
-        headers = ["fecha","signo","numero","luna"]
+soup = BeautifulSoup(html, "html.parser")
 
-    # si no hay URL real configurada aún, no hacemos nada
-    if not args.url or "example" in args.url:
-        log("[INFO] AstroLuna: sin URL configurada. No-op.")
-        if not headers: headers = ["fecha","signo","numero","luna"]
-        write_csv_dict(out, existing, headers)
-        return 0
+# Encuentra tablas dentro del contenedor de AstroLUNA
+tablas = soup.select("div.ganadores-historico table")
+if len(tablas) < 2:
+    log("[ERROR] No se encontró la tabla de AstroLUNA.")
+    exit(1)
 
-    session = mk_session()
+tabla_luna = tablas[1]
+rows = tabla_luna.select("tbody tr")
+
+# Carga fechas existentes
+fechas_existentes = cargar_fechas_existentes(DESTINO)
+nuevos = []
+
+for tr in rows:
+    cols = tr.find_all("td")
+    if len(cols) >= 3:
+        fecha_raw = cols[0].get_text(strip=True)
+        try:
+            fecha = datetime.strptime(fecha_raw, "%Y-%m-%d").strftime("%d/%m/%Y")
+        except ValueError:
+            log(f"[!] Fecha inválida ignorada: {fecha_raw}")
+            continue
+
+        numero = cols[1].get_text(strip=True)
+        signo = cols[2].get_text(strip=True)
+
+        if fecha not in fechas_existentes:
+            nuevos.append({
+                "fecha": fecha,
+                "numero": numero,
+                "signo": signo
+            })
+
+# Guarda nuevos registros si existen
+if nuevos:
     try:
-        html = fetch(session, args.url)
-        parsed = parse_rows(html)
-        # Evita sobrescribir si no hay filas nuevas
-        if not parsed:
-            log("[INFO] AstroLuna: sin nuevos registros parseables.")
-            write_csv_dict(out, existing, headers)
-            return 0
-        merged = merge_unique(existing, parsed, key_tuple=("fecha","signo"))
-        write_csv_dict(out, merged, headers)
-        log(f"[OK ] AstroLuna: +{len(merged)-len(existing)} nuevas / total {len(merged)}")
+        guardar_nuevos(DESTINO, ["fecha", "numero", "signo"], nuevos)
+        log(f"[✓] AstroLuna: {len(nuevos)} nuevos registros guardados")
     except Exception as e:
-        log(f"[WARN] AstroLuna fallo: {e}. CSV intacto.")
-    return 0
+        log(f"[ERROR] No se pudo guardar archivo: {e}")
+else:
+    log("[INFO] AstroLuna: sin nuevos registros")
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+log("✅ Scrapeo completado")

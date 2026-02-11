@@ -1,100 +1,126 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Resultados Revancha (últimos N) -> data\crudo\revancha_resultados.csv
-Header: sorteo,fecha,n1,n2,n3,n4,n5,superbalota
-"""
-import argparse, re
-from pathlib import Path
-from scraper_utils import mk_session, fetch, soupify, read_csv_dict, write_csv_dict, merge_unique, to_int, log
+import os
+import time
+import requests
+import locale
+from bs4 import BeautifulSoup
+from datetime import datetime
+from scraper_utils import log, cargar_sorteos_existentes, guardar_nuevos
 
-URL_FMT = "https://www.baloto.com/resultados-revancha/{sorteo}"
+OUTPUT_DIR = "C:/RadarPremios/data/crudo"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+CSV_FILENAME = os.path.join(OUTPUT_DIR, "revancha_resultados.csv")
 
-RE_NUMS = re.compile(r"(?:Revancha|Resultados)?.*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?(?:super\s*balota|sb|superbalota)\D*(\d{1,2})", re.I | re.S)
-RE_FECHA = re.compile(r"(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})")
+BASE_URL = "https://baloto.com/resultados-revancha/{}"
+SORTEO_INICIAL = 2081
+MAX_REINTENTOS = 3
+DELAY_REINTENTOS = 2.5
+DELAY_LOOP = 0.6
 
-def parse_page(html):
-    soup = soupify(html)
-    # por selectores
-    balls = [b.get_text(strip=True) for b in soup.select(".ball, .numero, .ball-number, li.ball span")]
-    balls = [x for x in balls if x.isdigit()]
-    nums = None
-    if len(balls) >= 6:
-        nums = list(map(int, balls[:6]))
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-    fecha = None
-    for sel in (".date", ".fecha", ".draw-date", "time", "p"):
-        el = soup.select_one(sel)
-        if el:
-            m = RE_FECHA.search(el.get_text(" ", strip=True))
-            if m:
-                fecha = m.group(1)
-                break
+# Config regional
+try:
+    locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
+except:
+    try:
+        locale.setlocale(locale.LC_TIME, 'es_CO.UTF-8')
+    except:
+        locale.setlocale(locale.LC_TIME, 'Spanish_Spain')
 
-    if nums is None:
-        m = RE_NUMS.search(html)
-        if m: nums = list(map(int, m.groups()))
-    if fecha is None:
-        m = RE_FECHA.search(html)
-        if m: fecha = m.group(1)
 
-    if nums and len(nums)==6:
-        n1,n2,n3,n4,n5,sb = nums
-        return {"fecha": fecha, "n1": n1, "n2": n2, "n3": n3, "n4": n4, "n5": n5, "superbalota": sb}
+def obtener_html(url):
+    for intento in range(1, MAX_REINTENTOS + 1):
+        try:
+            r = requests.get(url, timeout=15, headers=HEADERS)
+            r.raise_for_status()
+            return r.text
+        except requests.exceptions.RequestException as e:
+            log(f"[REINTENTO {intento}] Error al acceder {url}: {e}")
+            if intento < MAX_REINTENTOS:
+                time.sleep(DELAY_REINTENTOS)
+    log(f"[ERROR] Fallo permanente al acceder a {url}")
     return None
 
+
+def extraer_fecha(soup, sorteo):
+    try:
+        fecha_divs = soup.select(".gotham-medium.dark-blue")
+        for div in fecha_divs:
+            texto = div.get_text(strip=True)
+            if "de" in texto.lower():
+                return datetime.strptime(texto, "%d de %B de %Y").strftime("%Y-%m-%d")
+        log(f"[!] Sorteo {sorteo}: fecha no encontrada")
+    except Exception as e:
+        log(f"[!] Sorteo {sorteo}: error extrayendo fecha: {e}")
+    return None
+
+
+def parsear_resultado(html, sorteo):
+    soup = BeautifulSoup(html, 'html.parser')
+    contenedor = soup.find("div", class_="col-md-6 order-1 order-md-1 order-lg-1")
+    if not contenedor:
+        log(f"[!] Sorteo {sorteo}: contenedor de resultados no encontrado")
+        return None
+
+    fecha = extraer_fecha(soup, sorteo)
+    if not fecha:
+        return None
+
+    bolas = contenedor.select(".yellow-ball")
+    sb = contenedor.select_one(".red-ball")
+    if len(bolas) < 5 or not sb:
+        log(f"[!] Sorteo {sorteo} tiene bolas incompletas")
+        return None
+
+    numeros = [b.get_text(strip=True) for b in bolas][:5]
+    superbalota = sb.get_text(strip=True)
+
+    return {
+        "sorteo": sorteo,
+        "modo": "revancha",
+        "fecha": fecha,
+        "n1": numeros[0],
+        "n2": numeros[1],
+        "n3": numeros[2],
+        "n4": numeros[3],
+        "n5": numeros[4],
+        "sb": superbalota
+    }
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--last", type=int, default=8)
-    ap.add_argument("--from", dest="from_sorteo", type=int, default=None)
-    ap.add_argument("--to", dest="to_sorteo", type=int, default=None)
-    ap.add_argument("--out", required=True)
-    args = ap.parse_args()
+    log("=== Inicio de scrapeo de resultados Revancha ===")
+    sorteos_existentes = cargar_sorteos_existentes(CSV_FILENAME)
+    sorteo_actual = max(sorteos_existentes) if sorteos_existentes else SORTEO_INICIAL - 1
+    nuevos_resultados = []
 
-    out = Path(args.out)
-    headers, rows = read_csv_dict(out)
-    if not headers:
-        headers = ["sorteo","fecha","n1","n2","n3","n4","n5","superbalota"]
+    while True:
+        sorteo_actual += 1
+        url = BASE_URL.format(sorteo_actual)
+        log(f"⏳ Sorteo {sorteo_actual} -> {url}")
+        html = obtener_html(url)
+        if not html:
+            break
 
-    session = mk_session()
+        resultado = parsear_resultado(html, sorteo_actual)
+        if not resultado:
+            break
 
-    existentes = set(to_int(r.get("sorteo")) for r in rows if to_int(r.get("sorteo")))
-    if args.from_sorteo and args.to_sorteo:
-        step = 1 if args.to_sorteo >= args.from_sorteo else -1
-        sorteos = list(range(args.from_sorteo, args.to_sorteo+step, step))
-    else:
-        start = (max(existentes) + 1) if existentes else None
-        if start is None:
-            log("[INFO] Sin base de sorteo inicial. Usa --from/--to para backfill.")
-            write_csv_dict(out, rows, headers)
-            return 0
-        sorteos = list(range(start, start + args.last))
+        if sorteo_actual in sorteos_existentes:
+            log(f"[✓] Sorteo {sorteo_actual} ya registrado ({resultado['fecha']})")
+            continue
 
-    new_rows=[]
-    for s in sorteos:
-        url = URL_FMT.format(sorteo=s)
-        log(f"[INFO] Sorteo {s} -> {url}")
-        try:
-            html = fetch(session, url)
-            parsed = parse_page(html)
-            if parsed:
-                parsed["sorteo"] = s
-                new_rows.append({k: str(v) for k,v in parsed.items()})
-                log(f"[OK ] Sorteo {s}: {parsed}")
-            else:
-                log(f"[WARN] No pude parsear Sorteo {s}")
-        except Exception as e:
-            log(f"[WARN] Sorteo {s} fallo: {e}")
+        nuevos_resultados.append(resultado)
+        time.sleep(DELAY_LOOP)
 
-    if not new_rows:
-        log("[INFO] No hay filas nuevas.")
-        return 0
+    guardar_nuevos(
+        CSV_FILENAME,
+        ["sorteo", "modo", "fecha", "n1", "n2", "n3", "n4", "n5", "sb"],
+        nuevos_resultados
+    )
 
-    merged = merge_unique(rows, new_rows, key_tuple=("sorteo",))
-    merged.sort(key=lambda r: to_int(r.get("sorteo")) or 0)
-    write_csv_dict(out, merged, headers)
-    log(f"[OK ] Guardé {len(new_rows)} nuevas / total {len(merged)}")
-    return 0
+    log("✅ Scrapeo completado")
+
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

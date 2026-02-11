@@ -1,97 +1,125 @@
 import os
-import csv
 import time
 import requests
+import locale
 from bs4 import BeautifulSoup
 from datetime import datetime
+from scraper_utils import log, cargar_sorteos_existentes, guardar_nuevos
 
-SORTEO_INICIAL = 2081
-SORTEO_FINAL = 2533  # Se ajustará dinámicamente si es necesario
-MODO = "revancha"
-OUTPUT_FILE = "C:/RadarPremios/data/crudo/revancha_resultados.csv"
+OUTPUT_DIR = "C:/RadarPremios/data/crudo"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+CSV_FILENAME = os.path.join(OUTPUT_DIR, "revancha_resultados.csv")
+
 BASE_URL = "https://baloto.com/resultados-revancha/{}"
+SORTEO_INICIAL = 2081
+MAX_REINTENTOS = 3
+DELAY_REINTENTOS = 2.5
+DELAY_LOOP = 0.6
+
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# Config regional
+try:
+    locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
+except:
+    try:
+        locale.setlocale(locale.LC_TIME, 'es_CO.UTF-8')
+    except:
+        locale.setlocale(locale.LC_TIME, 'Spanish_Spain')
 
 
 def obtener_html(url):
+    for intento in range(1, MAX_REINTENTOS + 1):
+        try:
+            r = requests.get(url, timeout=15, headers=HEADERS)
+            r.raise_for_status()
+            return r.text
+        except requests.exceptions.RequestException as e:
+            log(f"[REINTENTO {intento}] Error al acceder {url}: {e}")
+            if intento < MAX_REINTENTOS:
+                time.sleep(DELAY_REINTENTOS)
+    log(f"[ERROR] Fallo permanente al acceder a {url}")
+    return None
+
+
+def extraer_fecha(soup, sorteo):
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        return r.text
+        fecha_divs = soup.select(".gotham-medium.dark-blue")
+        for div in fecha_divs:
+            texto = div.get_text(strip=True)
+            if "de" in texto.lower():
+                return datetime.strptime(texto, "%d de %B de %Y").strftime("%Y-%m-%d")
+        log(f"[!] Sorteo {sorteo}: fecha no encontrada")
     except Exception as e:
-        print(f"[ERROR] Error accediendo a {url}: {e}")
+        log(f"[!] Sorteo {sorteo}: error extrayendo fecha: {e}")
+    return None
+
+
+def parsear_resultado(html, sorteo):
+    soup = BeautifulSoup(html, 'html.parser')
+    contenedor = soup.find("div", class_="col-md-6 order-1 order-md-1 order-lg-1")
+    if not contenedor:
+        log(f"[!] Sorteo {sorteo}: contenedor de resultados no encontrado")
         return None
 
-
-def extraer_fecha(soup):
-    try:
-        texto_fecha = soup.select_one(".border-left-blue .gotham-medium.dark-blue:nth-child(3)")
-        if texto_fecha:
-            return texto_fecha.text.strip()
-    except Exception:
-        pass
-    return ""
-
-
-def extraer_bolas(soup):
-    bolas = soup.select(".yellow-ball.gotham-medium, .red-ball.gotham-medium")
-    numeros = [b.text.strip() for b in bolas if b.text.strip().isdigit()]
-    return numeros if len(numeros) == 6 else None
-
-
-def scrape_resultado(sorteo):
-    url = BASE_URL.format(sorteo)
-    html = obtener_html(url)
-    if not html:
+    fecha = extraer_fecha(soup, sorteo)
+    if not fecha:
         return None
 
-    soup = BeautifulSoup(html, "html.parser")
-
-    bolas = extraer_bolas(soup)
-    if not bolas or len(bolas) < 6:
-        print(f"[WARNING] Sorteo {sorteo}: bolas insuficientes")
+    bolas = contenedor.select(".yellow-ball")
+    sb = contenedor.select_one(".red-ball")
+    if len(bolas) < 5 or not sb:
+        log(f"[!] Sorteo {sorteo} tiene bolas incompletas")
         return None
 
-    fecha = extraer_fecha(soup)
+    numeros = [b.get_text(strip=True) for b in bolas][:5]
+    superbalota = sb.get_text(strip=True)
 
     return {
         "sorteo": sorteo,
-        "modo": MODO,
+        "modo": "revancha",
         "fecha": fecha,
-        "n1": bolas[0],
-        "n2": bolas[1],
-        "n3": bolas[2],
-        "n4": bolas[3],
-        "n5": bolas[4],
-        "sb": bolas[5],
+        "n1": numeros[0],
+        "n2": numeros[1],
+        "n3": numeros[2],
+        "n4": numeros[3],
+        "n5": numeros[4],
+        "sb": superbalota
     }
 
 
 def main():
-    print("[🟢] Inicio de scrapeo Revancha")
-    print(f"⏳ Scrapeando Revancha desde sorteo {SORTEO_INICIAL} hasta {SORTEO_FINAL}")
+    log("=== Inicio de scrapeo de resultados Revancha ===")
+    sorteos_existentes = cargar_sorteos_existentes(CSV_FILENAME)
+    sorteo_actual = max(sorteos_existentes) if sorteos_existentes else SORTEO_INICIAL - 1
+    nuevos_resultados = []
 
-    resultados = []
-    for sorteo in range(SORTEO_INICIAL, SORTEO_FINAL + 1):
-        try:
-            resultado = scrape_resultado(sorteo)
-            if resultado:
-                resultados.append(resultado)
-            time.sleep(0.8)
-        except Exception as e:
-            print(f"[ERROR] Sorteo {sorteo} falló inesperadamente: {e}")
+    while True:
+        sorteo_actual += 1
+        url = BASE_URL.format(sorteo_actual)
+        log(f"⏳ Sorteo {sorteo_actual} -> {url}")
+        html = obtener_html(url)
+        if not html:
+            break
+
+        resultado = parsear_resultado(html, sorteo_actual)
+        if not resultado:
+            break
+
+        if sorteo_actual in sorteos_existentes:
+            log(f"[✓] Sorteo {sorteo_actual} ya registrado ({resultado['fecha']})")
             continue
 
-    if resultados:
-        os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-        with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["sorteo", "modo", "fecha", "n1", "n2", "n3", "n4", "n5", "sb"])
-            writer.writeheader()
-            writer.writerows(resultados)
-        print(f"[✅] {len(resultados)} sorteos guardados en {OUTPUT_FILE}")
-    else:
-        print("⚠️ No se encontró información válida para guardar.")
+        nuevos_resultados.append(resultado)
+        time.sleep(DELAY_LOOP)
 
-    print("[✅] Finalizado")
+    guardar_nuevos(
+        CSV_FILENAME,
+        ["sorteo", "modo", "fecha", "n1", "n2", "n3", "n4", "n5", "sb"],
+        nuevos_resultados
+    )
+
+    log("✅ Scrapeo completado")
 
 
 if __name__ == "__main__":

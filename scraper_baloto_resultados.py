@@ -1,121 +1,124 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Scrapea resultados Baloto (últimos N sorteos) y hace merge en data\crudo\baloto_resultados.csv
-Header esperado: sorteo,fecha,n1,n2,n3,n4,n5,superbalota
-"""
-import argparse, re
-from pathlib import Path
-from scraper_utils import mk_session, fetch, soupify, read_csv_dict, write_csv_dict, merge_unique, to_int, log
+import os
+import time
+import locale
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+from scraper_utils import log, cargar_sorteos_existentes, guardar_nuevos
 
-URL_FMT = "https://www.baloto.com/resultados-baloto/{sorteo}"
+# Configuración general
+OUTPUT_DIR = "C:/RadarPremios/data/crudo"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+CSV_FILENAME = os.path.join(OUTPUT_DIR, "baloto_resultados.csv")
 
-# REGEX de respaldo para capturar 5 números + SB (con o sin prefijos)
-RE_NUMS = re.compile(r"(?:Baloto|Resultados)?.*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?(?:super\s*balota|sb|superbalota)\D*(\d{1,2})", re.I | re.S)
-RE_FECHA = re.compile(r"(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})")
+BASE_URL = "https://www.baloto.com/resultados-baloto/{}"
+SORTEO_INICIAL = 2081
+MAX_REINTENTOS = 3
+DELAY_REINTENTOS = 2.5
+DELAY_LOOP = 0.6
 
-def parse_page(html):
-    soup = soupify(html)
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-    # 1) Intento por selectores habituales (puedes ajustar si cambia el sitio)
-    # Busca "ball" como spans o lis
-    balls = [b.get_text(strip=True) for b in soup.select(".ball, .numero, .ball-number, li.ball span")]
-    balls = [x for x in balls if x.isdigit()]
-    nums = None
-    if len(balls) >= 6:
-        # supón 5 primeros + último SB
-        nums = list(map(int, balls[:6]))
+# Configuración regional
+try:
+    locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
+except:
+    try:
+        locale.setlocale(locale.LC_TIME, 'es_CO.UTF-8')
+    except:
+        locale.setlocale(locale.LC_TIME, 'Spanish_Spain')
 
-    # 2) Fecha por selectores
-    fecha = None
-    for sel in (".date", ".fecha", ".draw-date", "time", "p"):
-        el = soup.select_one(sel)
-        if el:
-            m = RE_FECHA.search(el.get_text(" ", strip=True))
-            if m:
-                fecha = m.group(1)
-                break
-
-    # 3) Fallback regex global
-    if nums is None:
-        m = RE_NUMS.search(html)
-        if m:
-            nums = list(map(int, m.groups()))
-
-    if fecha is None:
-        m = RE_FECHA.search(html)
-        if m:
-            fecha = m.group(1)
-
-    if nums and len(nums) == 6:
-        n1,n2,n3,n4,n5,sb = nums
-        return {"fecha": fecha, "n1": n1, "n2": n2, "n3": n3, "n4": n4, "n5": n5, "superbalota": sb}
+def obtener_html(url):
+    for intento in range(1, MAX_REINTENTOS + 1):
+        try:
+            r = requests.get(url, timeout=15, headers=HEADERS)
+            r.raise_for_status()
+            return r.text
+        except requests.exceptions.RequestException as e:
+            log(f"[REINTENTO {intento}] Error al acceder {url}: {e}")
+            if intento < MAX_REINTENTOS:
+                time.sleep(DELAY_REINTENTOS)
+    log(f"[ERROR] Fallo permanente al acceder a {url}")
     return None
 
+def extraer_fecha(soup, sorteo):
+    try:
+        fecha_divs = soup.select(".gotham-medium.dark-blue")
+        for div in fecha_divs:
+            texto = div.get_text(strip=True)
+            if "de" in texto.lower():
+                return datetime.strptime(texto, "%d de %B de %Y").strftime("%Y-%m-%d")
+    except Exception as e:
+        log(f"[!] Sorteo {sorteo}: error extrayendo fecha: {e}")
+    return None
+
+def extraer_resultado(soup, sorteo, fecha):
+    contenedor = soup.find("div", class_="col-md-6 order-1 order-md-1 order-lg-1")
+    if not contenedor:
+        log(f"[!] Sorteo {sorteo}: contenedor no encontrado")
+        return None
+
+    bolas = contenedor.select(".yellow-ball")
+    sb = contenedor.select_one(".red-ball")
+
+    if len(bolas) < 5 or not sb:
+        log(f"[!] Sorteo {sorteo}: bolas insuficientes")
+        return None
+
+    numeros = [b.get_text(strip=True) for b in bolas[:5]]
+    superbalota = sb.get_text(strip=True)
+
+    return {
+        "sorteo": sorteo,
+        "modo": "baloto",
+        "fecha": fecha,
+        "n1": numeros[0],
+        "n2": numeros[1],
+        "n3": numeros[2],
+        "n4": numeros[3],
+        "n5": numeros[4],
+        "sb": superbalota
+    }
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--last", type=int, default=8, help="Cantidad de sorteos hacia atrás (incluye el último)")
-    ap.add_argument("--from", dest="from_sorteo", type=int, default=None)
-    ap.add_argument("--to", dest="to_sorteo", type=int, default=None)
-    ap.add_argument("--out", required=True)
-    args = ap.parse_args()
+    log("=== Inicio de scrapeo de Baloto ===")
+    sorteos_existentes = cargar_sorteos_existentes(CSV_FILENAME)
+    sorteo_actual = max(sorteos_existentes) if sorteos_existentes else SORTEO_INICIAL - 1
+    nuevos_resultados = []
 
-    out = Path(args.out)
-    headers, rows = read_csv_dict(out)
-    if not headers:
-        headers = ["sorteo","fecha","n1","n2","n3","n4","n5","superbalota"]
+    while True:
+        sorteo_actual += 1
+        url = BASE_URL.format(sorteo_actual)
+        log(f"⏳ Sorteo {sorteo_actual} -> {url}")
 
-    session = mk_session()
+        html = obtener_html(url)
+        if not html:
+            break
 
-    sorteos = []
-    if args.from_sorteo and args.to_sorteo:
-        step = 1 if args.to_sorteo >= args.from_sorteo else -1
-        sorteos = list(range(args.from_sorteo, args.to_sorteo+step, step))
-    else:
-        # heurística: si ya hay datos, continúa desde el max sorteo
-        max_s = 0
-        for r in rows:
-            s = to_int(r.get("sorteo"))
-            if s and s > max_s: max_s = s
-        start = max_s + 1 if max_s else None
-        if start is None:
-            # si no hay, intenta últimos N asumiendo numeración contínua (ajusta si prefieres pasar /from /to)
-            # aquí el usuario típicamente usa /last 8 como en tus logs
-            # sin base de "último sorteo" real, no podemos adivinar el número exacto -> pedimos N y probamos hacia atrás desde una ventana razonable
-            # Para no golpear el sitio con 1000, usa rango corto y “sólo si existe”
-            # Sugerencia: fija manualmente /from /to cuando quieras backfill.
-            log("[INFO] No tengo base de sorteo inicial. Intenta usar --from/--to para backfill.")
-            # No intentamos adivinar. Salimos sin cambios.
-            write_csv_dict(out, rows, headers)
-            return 0
-        sorteos = list(range(start, start + args.last))
+        soup = BeautifulSoup(html, 'html.parser')
+        fecha = extraer_fecha(soup, sorteo_actual)
+        if not fecha:
+            break
 
-    new_rows = []
-    for s in sorteos:
-        url = URL_FMT.format(sorteo=s)
-        log(f"[INFO] Sorteo {s} -> {url}")
-        try:
-            html = fetch(session, url)
-            parsed = parse_page(html)
-            if parsed:
-                parsed["sorteo"] = s
-                new_rows.append({k: str(v) for k,v in parsed.items()})
-                log(f"[OK ] Sorteo {s}: {parsed}")
-            else:
-                log(f"[WARN] No pude parsear Sorteo {s} (selector/regex)")
-        except Exception as e:
-            log(f"[WARN] Sorteo {s} fallo: {e}")
+        if sorteo_actual in sorteos_existentes:
+            log(f"[✓] Sorteo {sorteo_actual} ya registrado ({fecha})")
+            continue
 
-    if not new_rows:
-        log("[INFO] No hay filas nuevas válidas. CSV intacto.")
-        return 0
+        resultado = extraer_resultado(soup, sorteo_actual, fecha)
+        if resultado:
+            nuevos_resultados.append(resultado)
+        else:
+            log(f"[!] Sorteo {sorteo_actual}: resultado incompleto")
 
-    merged = merge_unique(rows, new_rows, key_tuple=("sorteo",))
-    # ordenar por sorteo asc
-    merged.sort(key=lambda r: to_int(r.get("sorteo")) or 0)
-    write_csv_dict(out, merged, headers)
-    log(f"[OK ] Guardé {len(new_rows)} nuevos / total {len(merged)}")
-    return 0
+        time.sleep(DELAY_LOOP)
+
+    guardar_nuevos(
+        CSV_FILENAME,
+        ["sorteo", "modo", "fecha", "n1", "n2", "n3", "n4", "n5", "sb"],
+        nuevos_resultados
+    )
+
+    log("✅ Scrapeo completado")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

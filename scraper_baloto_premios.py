@@ -1,120 +1,141 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Scrapea premios Baloto por sorteo (múltiples filas por sorteo).
-Header: sorteo,categoria,aciertos,ganadores,premio
-"""
-import argparse, re
-from pathlib import Path
-from scraper_utils import mk_session, fetch, soupify, read_csv_dict, write_csv_dict, merge_unique, clean_money, to_int, log
+# scraper_baloto_premios.py
 
-URL_FMT = "https://www.baloto.com/resultados-baloto/{sorteo}"
+import os
+import time
+import locale
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+from scraper_utils import log, cargar_premios_existentes, guardar_nuevos_premios
 
-# Selectores candidatos típicos de tablas de premios
-SELECTORES_TABLA = [
-    "table", ".prizes table", ".tabla-premios table", ".results-table table"
-]
-RE_ROW = re.compile(r"(Acertantes|Ganadores|Categor[ií]a|Aciertos)", re.I)
+# Configuración general
+OUTPUT_DIR = "C:/RadarPremios/data/crudo"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+CSV_FILENAME = os.path.join(OUTPUT_DIR, "baloto_premios.csv")
 
-def parse_premios(html):
-    soup = soupify(html)
-    tablas = []
-    for sel in SELECTORES_TABLA:
-        tablas.extend(soup.select(sel))
-    # Filtra tablas que luzcan de premios
-    candidatas = []
-    for t in tablas:
-        txt = t.get_text(" ", strip=True)
-        if RE_ROW.search(txt):
-            candidatas.append(t)
-    rows=[]
-    for t in candidatas:
-        for tr in t.select("tr"):
-            cols = [c.get_text(" ", strip=True) for c in tr.find_all(["td","th"])]
-            if len(cols) < 3: 
-                continue
-            rowtxt = " | ".join(cols)
-            if not RE_ROW.search(rowtxt) and (any(ch.isdigit() for ch in rowtxt) or "$" in rowtxt):
-                # heurística: [categoria/aciertos] [ganadores] [premio]
-                categoria = cols[0]
-                aciertos = None
-                # intenta detectar patrón “x+y” como aciertos
-                m = re.search(r"\d\+\d|\d{1,2}", categoria)
-                if m: aciertos = m.group(0)
-                ganadores = None
-                premio = None
-                for c in cols[1:]:
-                    if ganadores is None and re.search(r"\d", c) and not "$" in c:
-                        ganadores = to_int(c)
-                    if premio is None and "$" in c:
-                        premio = clean_money(c)
-                rows.append({
-                    "categoria": categoria,
-                    "aciertos": aciertos or "",
-                    "ganadores": ganadores if ganadores is not None else "",
-                    "premio": premio or ""
-                })
-    return rows
+BASE_URL = "https://baloto.com/resultados-baloto/{}"
+SORTEO_INICIAL = 2081
+MAX_REINTENTOS = 3
+DELAY_REINTENTOS = 2.5
+DELAY_LOOP = 0.6
+
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# Configuración regional
+try:
+    locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
+except:
+    try:
+        locale.setlocale(locale.LC_TIME, 'es_CO.UTF-8')
+    except:
+        locale.setlocale(locale.LC_TIME, 'Spanish_Spain')
+
+
+def obtener_html(url):
+    for intento in range(1, MAX_REINTENTOS + 1):
+        try:
+            r = requests.get(url, timeout=15, headers=HEADERS)
+            r.raise_for_status()
+            return r.text
+        except requests.exceptions.RequestException as e:
+            log(f"[REINTENTO {intento}] Error al acceder {url}: {e}")
+            if intento < MAX_REINTENTOS:
+                time.sleep(DELAY_REINTENTOS)
+    log(f"[ERROR] Fallo permanente al acceder a {url}")
+    return None
+
+
+def extraer_fecha(soup, sorteo):
+    try:
+        fecha_divs = soup.select(".gotham-medium.dark-blue")
+        for div in fecha_divs:
+            texto = div.get_text(strip=True)
+            if "de" in texto.lower():
+                return datetime.strptime(texto, "%d de %B de %Y").strftime("%Y-%m-%d")
+    except Exception as e:
+        log(f"[!] Error extrayendo fecha en sorteo {sorteo}: {e}")
+    return None
+
+
+def extraer_tabla_premios(soup, sorteo, fecha):
+    tabla = soup.select_one("table.table-striped")
+    if not tabla:
+        log(f"[!] Sorteo {sorteo}: tabla de premios no encontrada")
+        return []
+
+    premios = []
+    filas = tabla.select("tbody tr")
+    for fila in filas:
+        columnas = fila.select("td")
+        if len(columnas) != 4:
+            continue
+
+        aciertos = ""
+        yellow = fila.select_one(".yellow-ball-results")
+        pink = fila.select_one(".pink-ball-results")
+
+        if yellow:
+            aciertos = yellow.get_text(strip=True)
+        if pink:
+            aciertos += "+SB"
+
+        premio_total = columnas[1].get_text(strip=True).replace('\xa0', ' ')
+        ganadores = columnas[2].get_text(strip=True)
+        premio_por_ganador = columnas[3].get_text(strip=True)
+
+        premios.append({
+            "sorteo": sorteo,
+            "modo": "baloto",
+            "fecha": fecha,
+            "aciertos": aciertos,
+            "premio_total": premio_total,
+            "ganadores": ganadores,
+            "premio_por_ganador": premio_por_ganador
+        })
+
+    return premios
+
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--last", type=int, default=8)
-    ap.add_argument("--from", dest="from_sorteo", type=int, default=None)
-    ap.add_argument("--to", dest="to_sorteo", type=int, default=None)
-    ap.add_argument("--out", required=True)
-    args = ap.parse_args()
+    log("=== Inicio de scrapeo de premios Baloto ===")
+    sorteos_existentes = cargar_premios_existentes(CSV_FILENAME)
+    sorteo_actual = max(sorteos_existentes) if sorteos_existentes else SORTEO_INICIAL - 1
+    nuevos_premios = []
 
-    out = Path(args.out)
-    headers, rows = read_csv_dict(out)
-    if not headers:
-        headers = ["sorteo","categoria","aciertos","ganadores","premio"]
+    while True:
+        sorteo_actual += 1
+        if sorteo_actual in sorteos_existentes:
+            continue
 
-    session = mk_session()
+        url = BASE_URL.format(sorteo_actual)
+        log(f"⏳ Sorteo {sorteo_actual} -> {url}")
 
-    # Establece rango de sorteos como en resultados: intenta continuar desde el mayor sorteo existente.
-    existentes_sorteos = set()
-    for r in rows:
-        s = to_int(r.get("sorteo"))
-        if s: existentes_sorteos.add(s)
+        html = obtener_html(url)
+        if not html:
+            break
 
-    if args.from_sorteo and args.to_sorteo:
-        step = 1 if args.to_sorteo >= args.from_sorteo else -1
-        sorteos = list(range(args.from_sorteo, args.to_sorteo+step, step))
-    else:
-        start = max(existentes_sorteos) + 1 if existentes_sorteos else None
-        if start is None:
-            log("[INFO] No hay base de sorteos. Usa --from/--to para backfill, o deja que resultados alimente el rango.")
-            write_csv_dict(out, rows, headers)
-            return 0
-        sorteos = list(range(start, start + args.last))
+        soup = BeautifulSoup(html, 'html.parser')
+        fecha = extraer_fecha(soup, sorteo_actual)
+        if not fecha:
+            break
 
-    new_rows=[]
-    for s in sorteos:
-        url = URL_FMT.format(sorteo=s)
-        log(f"[INFO] Sorteo {s} -> {url}")
-        try:
-            html = fetch(session, url)
-            premios = parse_premios(html)
-            if premios:
-                for pr in premios:
-                    pr["sorteo"] = s
-                new_rows.extend(premios)
-                log(f"[OK ] Sorteo {s}: {len(premios)} filas premios")
-            else:
-                log(f"[WARN] No pude encontrar tabla premios en {s}")
-        except Exception as e:
-            log(f"[WARN] Sorteo {s} fallo: {e}")
+        premios = extraer_tabla_premios(soup, sorteo_actual, fecha)
+        if premios:
+            nuevos_premios.extend(premios)
+            log(f"[✓] {len(premios)} premios extraídos")
+        else:
+            log(f"[!] Sorteo {sorteo_actual}: sin premios válidos")
 
-    if not new_rows:
-        log("[INFO] No hay filas nuevas. CSV intacto.")
-        return 0
+        time.sleep(DELAY_LOOP)
 
-    merged = merge_unique(rows, new_rows, key_tuple=("sorteo","categoria"))
-    # ordenar por sorteo asc
-    merged.sort(key=lambda r: (to_int(r.get("sorteo")) or 0, r.get("categoria","")))
-    write_csv_dict(out, merged, headers)
-    log(f"[OK ] Guardé {len(new_rows)} nuevas / total {len(merged)}")
-    return 0
+    guardar_nuevos_premios(
+        CSV_FILENAME,
+        ["sorteo", "modo", "fecha", "aciertos", "premio_total", "ganadores", "premio_por_ganador"],
+        nuevos_premios
+    )
+
+    log("✅ Scrapeo completado")
+
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
