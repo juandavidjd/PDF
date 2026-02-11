@@ -1,0 +1,27 @@
+[
+    {
+        "timestamp": "2025-12-06T21:43:49.472297",
+        "event": "SERVICE_START",
+        "message": "Health Monitor iniciado."
+    },
+    {
+        "timestamp": "2025-12-06T21:43:49.490303",
+        "event": "DIAGNOSTICS",
+        "message": "Ejecutando diagnóstico general..."
+    },
+    {
+        "timestamp": "2025-12-06T21:43:49.647567",
+        "event": "UPDATE_CHECK",
+        "message": "Buscando actualizaciones..."
+    },
+    {
+        "timestamp": "2025-12-06T21:43:49.816361",
+        "event": "FRONTEND_SYNC",
+        "message": "Sincronizando frontend SRM..."
+    },
+    {
+        "timestamp": "2025-12-06T21:43:49.930488",
+        "event": "INTEGRATOR",
+        "message": "Ejecutando integrador de sistemas SRM..."
+    }
+]

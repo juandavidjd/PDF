@@ -1,0 +1,8 @@
+{
+    "status": "RUNNING",
+    "last_update": "2025-12-06T21:43:49.802737",
+    "last_diagnostics": "2025-12-06T21:43:49.632297",
+    "services_running": {
+        "health_monitor": true
+    }
+}

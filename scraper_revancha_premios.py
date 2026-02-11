@@ -1,138 +1,104 @@
-# scraper_revancha_premios.py
-
-import os
-import time
-import locale
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
-from scraper_utils import log, cargar_premios_existentes, guardar_nuevos_premios
+import csv
+import os
+import time
 
-# Configuración general
-OUTPUT_DIR = "C:/RadarPremios/data/crudo"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-CSV_FILENAME = os.path.join(OUTPUT_DIR, "revancha_premios.csv")
+CSV_PATH = "../data/crudo/revancha_premios.csv"
+URL_TEMPLATE = "https://www.baloto.com/resultados-revancha/{sorteo}"
+INICIO_SORTEO = 2081
+FIN_SORTEO = 2533
 
-BASE_URL = "https://www.baloto.com/resultados-revancha/{}"
-SORTEO_INICIAL = 2081
-MAX_REINTENTOS = 3
-DELAY_REINTENTOS = 2.5
-DELAY_LOOP = 0.6
-
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-# Configuración regional
-try:
-    locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
-except:
-    try:
-        locale.setlocale(locale.LC_TIME, 'es_CO.UTF-8')
-    except:
-        locale.setlocale(locale.LC_TIME, 'Spanish_Spain')
-
-def obtener_html(url):
-    for intento in range(1, MAX_REINTENTOS + 1):
+def obtener_html(url, retries=3):
+    for intento in range(retries):
         try:
-            r = requests.get(url, timeout=15, headers=HEADERS)
-            r.raise_for_status()
-            return r.text
-        except requests.exceptions.RequestException as e:
-            log(f"[REINTENTO {intento}] Error al acceder {url}: {e}")
-            if intento < MAX_REINTENTOS:
-                time.sleep(DELAY_REINTENTOS)
-    log(f"[ERROR] Fallo permanente al acceder a {url}")
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.text
+        except:
+            time.sleep(2)
     return None
 
 def extraer_fecha(soup):
     try:
-        fecha_divs = soup.select(".gotham-medium.dark-blue")
-        for div in fecha_divs:
-            texto = div.get_text(strip=True)
-            if "de" in texto.lower():
-                return datetime.strptime(texto, "%d de %B de %Y").strftime("%Y-%m-%d")
-    except Exception as e:
-        log(f"[!] Error extrayendo fecha: {e}")
-    return None
+        fecha_tag = soup.select_one("div.col-md-6 .gotham-medium.dark-blue:nth-of-type(3)")
+        return fecha_tag.text.strip()
+    except:
+        return None
 
-def extraer_tabla_premios(soup, sorteo, fecha):
+def parsear_tabla(soup, sorteo, fecha):
     tabla = soup.select_one("table.table-striped")
     if not tabla:
-        log(f"[!] Sorteo {sorteo}: tabla de premios no encontrada")
+        print(f"[WARNING] Sorteo {sorteo}: tabla no encontrada")
         return []
 
     premios = []
     filas = tabla.select("tbody tr")
-
     for fila in filas:
         columnas = fila.select("td")
         if len(columnas) != 4:
             continue
 
-        aciertos = ""
-        yellow = fila.select_one(".yellow-ball-results")
-        pink = fila.select_one(".pink-ball-results")
+        categoria_raw = fila.select_one("td div.yellow-ball-results").text.strip()
+        tiene_sb = fila.select_one("td div.pink-ball-results") is not None
+        aciertos = f"{categoria_raw}+SB" if tiene_sb else categoria_raw
 
-        if yellow:
-            aciertos = yellow.get_text(strip=True)
-        if pink:
-            aciertos += "+SB"
-
-        premio_total = columnas[1].get_text(strip=True).replace('\xa0', ' ')
-        ganadores = columnas[2].get_text(strip=True)
-        premio_por_ganador = columnas[3].get_text(strip=True)
+        premio = columnas[1].text.strip()
+        ganadores = columnas[2].text.strip()
+        premio_x_ganador = columnas[3].text.strip()
 
         premios.append({
             "sorteo": sorteo,
             "modo": "revancha",
             "fecha": fecha,
             "aciertos": aciertos,
-            "premio_total": premio_total,
+            "premio_total": premio,
             "ganadores": ganadores,
-            "premio_por_ganador": premio_por_ganador
+            "premio_por_ganador": premio_x_ganador
         })
 
     return premios
 
+def guardar_csv(premios):
+    encabezados = ["sorteo", "modo", "fecha", "aciertos", "premio_total", "ganadores", "premio_por_ganador"]
+    with open(CSV_PATH, "w", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=encabezados)
+        writer.writeheader()
+        for row in premios:
+            writer.writerow(row)
+
 def main():
-    log("=== Inicio de scrapeo de premios Revancha ===")
-    sorteos_existentes = cargar_premios_existentes(CSV_FILENAME)
-    sorteo_actual = max(sorteos_existentes) if sorteos_existentes else SORTEO_INICIAL - 1
-    nuevos_premios = []
+    print("🟢 Inicio de scrapeo premios Revancha")
+    print(f"⏳ Scrapeando desde sorteo {INICIO_SORTEO} hasta {FIN_SORTEO}")
+    todos = []
 
-    while True:
-        sorteo_actual += 1
-        url = BASE_URL.format(sorteo_actual)
-        log(f"⏳ Sorteo {sorteo_actual} -> {url}")
-
+    for sorteo in range(INICIO_SORTEO, FIN_SORTEO + 1):
+        url = URL_TEMPLATE.format(sorteo=sorteo)
         html = obtener_html(url)
         if not html:
-            break
-
-        soup = BeautifulSoup(html, 'html.parser')
-        fecha = extraer_fecha(soup)
-        if not fecha:
-            break
-
-        if sorteo_actual in sorteos_existentes:
-            log(f"[✓] Sorteo {sorteo_actual} ya registrado ({fecha})")
+            print(f"[ERROR] Sorteo {sorteo}: sin respuesta")
             continue
 
-        premios = extraer_tabla_premios(soup, sorteo_actual, fecha)
+        soup = BeautifulSoup(html, "html.parser")
+        fecha = extraer_fecha(soup)
+        if not fecha:
+            print(f"[WARNING] Sorteo {sorteo}: sin fecha")
+            continue
+
+        premios = parsear_tabla(soup, sorteo, fecha)
         if premios:
-            nuevos_premios.extend(premios)
-            log(f"[✓] {len(premios)} premios extraídos")
+            todos.extend(premios)
+            print(f"[✓] Sorteo {sorteo}: {len(premios)} premios")
         else:
-            log(f"[!] Sorteo {sorteo_actual}: sin premios válidos")
+            print(f"[WARNING] Sorteo {sorteo}: sin premios válidos")
 
-        time.sleep(DELAY_LOOP)
+        time.sleep(0.8)
 
-    guardar_nuevos_premios(
-        CSV_FILENAME,
-        ["sorteo", "modo", "fecha", "aciertos", "premio_total", "ganadores", "premio_por_ganador"],
-        nuevos_premios
-    )
-
-    log("✅ Scrapeo completado")
+    if todos:
+        guardar_csv(todos)
+        print(f"\n✅ {len(todos)} premios guardados en {CSV_PATH}")
+    else:
+        print("\n⚠️ No se encontraron premios para guardar.")
 
 if __name__ == "__main__":
     main()
